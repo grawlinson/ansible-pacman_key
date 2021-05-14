@@ -7,24 +7,22 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-ANSIBLE_METADATA = {'metadata_version': '1.1',
-                    'status': ['preview'],
-                    'supported_by': 'community'}
-
 DOCUMENTATION = '''
 ---
 module: pacman_key
 author:
-- George Rawlinson (@grawlinson) <george@rawlinson.net.nz>
-version_added: "2.10"
+- George Rawlinson (@grawlinson)
+version_added: "1.3.0"
 short_description: Manage pacman's list of trusted keys
 description:
 - Add or remove gpg keys from the pacman keyring.
 notes:
-- Use full key id (16 characters) and fingerprint (40 characters) to avoid key collisions.
+- Use full key ID (16 characters) and fingerprint (40 characters) to avoid key collisions.
 - If you specify both the key id and the URL with C(state=present), the task can verify or add the key as needed.
 - By default, keys will be locally signed after being imported into the keyring.
 - If the specified key id exists in the keyring, the key will not be added.
+- I(data), I(file), and I(url) are mutually exclusive.
+- Supports C(check_mode).
 requirements:
 - gpg
 - pacman-key
@@ -81,34 +79,34 @@ options:
 
 EXAMPLES = '''
 - name: Import a key via local file
-  pacman_key:
+  community.general.pacman_key:
     data: "{{ lookup('file', 'keyfile.asc') }}"
     state: present
 
 - name: Import a key via remote file
-  pacman_key:
+  community.general.pacman_key:
     file: /tmp/keyfile.asc
     state: present
 
 - name: Import a key via url
-  pacman_key:
+  community.general.pacman_key:
     id: 01234567890ABCDE01234567890ABCDE12345678
     url: https://domain.tld/keys/keyfile.asc
     state: present
 
 - name: Import a key via keyserver
-  pacman_key:
+  community.general.pacman_key:
     id: 01234567890ABCDE01234567890ABCDE12345678
     keyserver: keyserver.domain.tld
 
 - name: Import a key into an alternative keyring
-  pacman_key:
+  community.general.pacman_key:
     id: 01234567890ABCDE01234567890ABCDE12345678
     file: /tmp/keyfile.asc
     keyring: /etc/pacman.d/gnupg-alternative
 
 - name: Remove a key from the keyring
-  pacman_key:
+  community.general.pacman_key:
     id: 01234567890ABCDE01234567890ABCDE12345678
     state: absent
 '''
@@ -142,6 +140,15 @@ class PacmanKey(object):
             fingerprint = self.sanitise_fingerprint(fingerprint)
         key_present = self.key_in_keyring(keyid, keyring)
 
+        if (
+            state == "present"
+            and data is None
+            and file is None
+            and url is None
+            and keyserver is None
+        ):
+            module.fail_json(msg="expected one of: data, file, url, keyserver. got none")
+
         if module.check_mode:
             if state == "present":
                 if (key_present and force_update) or not key_present:
@@ -171,8 +178,6 @@ class PacmanKey(object):
             elif keyserver:
                 self.recv_key(keyid, keyserver, keyring)
                 module.exit_json(changed=True)
-            else:
-                module.fail_json(msg="expected one of: data, file, url, keyserver. got none")
         elif state == "absent":
             if key_present:
                 self.remove_key(keyid)
@@ -332,3 +337,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
