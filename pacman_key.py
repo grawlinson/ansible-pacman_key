@@ -12,16 +12,16 @@ DOCUMENTATION = '''
 module: pacman_key
 author:
 - George Rawlinson (@grawlinson)
-version_added: "1.3.0"
+version_added: "3.2.0"
 short_description: Manage pacman's list of trusted keys
 description:
 - Add or remove gpg keys from the pacman keyring.
 notes:
-- Use full key ID (16 characters) and fingerprint (40 characters) to avoid key collisions.
-- If you specify both the key id and the URL with C(state=present), the task can verify or add the key as needed.
-- By default, keys will be locally signed after being imported into the keyring.
-- If the specified key id exists in the keyring, the key will not be added.
-- I(data), I(file), and I(url) are mutually exclusive.
+- Use full-length key ID (40 characters).
+- Keys will be verified when using I(data), I(file), or I(url) unless I(verify) is overridden.
+- Keys will be locally signed after being imported into the keyring.
+- If the key ID exists in the keyring, the key will not be added unless I(force_update) is specified.
+- I(data), I(file), I(url), and I(keyserver) are mutually exclusive.
 - Supports C(check_mode).
 requirements:
 - gpg
@@ -29,46 +29,47 @@ requirements:
 options:
     id:
         description:
-            - The 16 character identifier of the key.
+            - The 40 character identifier of the key.
             - Including this allows check mode to correctly report the changed state.
-            - Do not specify a subkey id, instead specify the master key id.
-        required: yes
+            - Do not specify a subkey ID, instead specify the primary key ID.
+        required: true
         type: str
     data:
         description:
             - The keyfile contents to add to the keyring.
-            - Must be of "PGP PUBLIC KEY BLOCK" type.
+            - Must be of C(PGP PUBLIC KEY BLOCK) type.
         type: str
     file:
         description:
             - The path to a keyfile on the remote server to add to the keyring.
-            - Remote file should be of "PGP PUBLIC KEY BLOCK" type.
+            - Remote file must be of C(PGP PUBLIC KEY BLOCK) type.
         type: path
     url:
         description:
             - The URL to retrieve keyfile from.
-            - Remote file should be of "PGP PUBLIC KEY BLOCK" type.
+            - Remote file must be of C(PGP PUBLIC KEY BLOCK) type.
         type: str
     keyserver:
         description:
             - The keyserver used to retrieve key from.
         type: str
-    fingerprint:
+    verify:
         description:
-            - 40 character fingerprint of the key.
-            - When specified, it is used for verification.
-        type: str
+            - Whether or not to verify the keyfile's key ID against specified key ID.
+        type: bool
+        default: true
     force_update:
         description:
             - This forces the key to be updated if it already exists in the keyring.
         type: bool
-        default: no
+        default: false
     keyring:
         description:
             - The full path to the keyring folder on the remote server.
-            - If not specified, module will use pacman's default (/etc/pacman.d/gnupg).
+            - If not specified, module will use pacman's default (C(/etc/pacman.d/gnupg)).
             - Useful if the remote system requires an alternative gnupg directory.
         type: path
+        default: /etc/pacman.d/gnupg
     state:
         description:
             - Ensures that the key is present (added) or absent (revoked).
@@ -123,37 +124,31 @@ from ansible.module_utils._text import to_native
 class PacmanKey(object):
     def __init__(self, module):
         self.module = module
+        # obtain binary paths for gpg & pacman-key
         self.gpg = module.get_bin_path('gpg', required=True)
         self.pacman_key = module.get_bin_path('pacman-key', required=True)
+
+        # obtain module parameters
         keyid = module.params['id']
         url = module.params['url']
         data = module.params['data']
         file = module.params['file']
         keyserver = module.params['keyserver']
-        fingerprint = module.params['fingerprint']
+        verify = module.params['verify']
         force_update = module.params['force_update']
         keyring = module.params['keyring']
         state = module.params['state']
+        self.keylength = 40
 
+        # sanitise key ID & check if key exists in the keyring
         keyid = self.sanitise_keyid(keyid)
-        if fingerprint:
-            fingerprint = self.sanitise_fingerprint(fingerprint)
-        key_present = self.key_in_keyring(keyid, keyring)
+        key_present = self.key_in_keyring(keyring, keyid)
 
-        if (
-            state == "present"
-            and data is None
-            and file is None
-            and url is None
-            and keyserver is None
-        ):
-            module.fail_json(msg="expected one of: data, file, url, keyserver. got none")
-
+        # check mode
         if module.check_mode:
             if state == "present":
-                if (key_present and force_update) or not key_present:
-                    module.exit_json(changed=True)
-                module.exit_json(changed=False)
+                changed = (key_present and force_update) or not key_present
+                module.exit_json(changed=changed)
             elif state == "absent":
                 if key_present:
                     module.exit_json(changed=True)
@@ -165,22 +160,22 @@ class PacmanKey(object):
 
             if data:
                 file = self.save_key(data)
-                self.add_key(file, keyid, fingerprint, keyring)
+                self.add_key(keyring, file, keyid, verify)
                 module.exit_json(changed=True)
             elif file:
-                self.add_key(file, keyid, fingerprint, keyring)
+                self.add_key(keyring, file, keyid, verify)
                 module.exit_json(changed=True)
             elif url:
                 data = self.fetch_key(url)
                 file = self.save_key(data)
-                self.add_key(file, keyid, fingerprint, keyring)
+                self.add_key(keyring, file, keyid, verify)
                 module.exit_json(changed=True)
             elif keyserver:
-                self.recv_key(keyid, keyserver, keyring)
+                self.recv_key(keyring, keyid, keyserver)
                 module.exit_json(changed=True)
         elif state == "absent":
             if key_present:
-                self.remove_key(keyid)
+                self.remove_key(keyring, keyid)
                 module.exit_json(changed=True)
             module.exit_json(changed=False)
 
@@ -193,22 +188,16 @@ class PacmanKey(object):
         return True
 
     def sanitise_keyid(self, keyid):
-        """Sanitise given keyid"""
-        keyid = keyid.strip().upper().replace('0X', '')
-        if len(keyid) != 16:
-            self.module.fail_json(msg="keyid is not 16 characters: %s" % keyid)
-        if not self.is_hexadecimal(keyid):
-            self.module.fail_json(msg="keyid is not hexadecimal: %s" % keyid)
-        return keyid
+        """Sanitise given key ID.
 
-    def sanitise_fingerprint(self, fingerprint):
-        """Sanitise given fingerprint"""
-        fingerprint = fingerprint.strip().upper().replace(' ', '').replace('0X', '')
-        if len(fingerprint) != 40:
-            self.module.fail_json(msg="fingerprint is not 40 characters: %s" % fingerprint)
-        if not self.is_hexadecimal(fingerprint):
-            self.module.fail_json(msg="fingerprint is not hexadecimal: %s" % fingerprint)
-        return fingerprint
+        Strips whitespace, uppercases all characters, and strips leading `0X`.
+        """
+        sanitised_keyid = keyid.strip().upper().replace(' ', '').replace('0X', '')
+        if len(sanitised_keyid) != self.keylength:
+            self.module.fail_json(msg="key ID is not full-length: %s" % sanitised_keyid)
+        if not self.is_hexadecimal(sanitised_keyid):
+            self.module.fail_json(msg="key ID is not hexadecimal: %s" % sanitised_keyid)
+        return sanitised_keyid
 
     def fetch_key(self, url):
         """Downloads a key from url"""
@@ -217,28 +206,16 @@ class PacmanKey(object):
             self.module.fail_json(msg="failed to fetch key at %s, error was %s" % (url, info['msg']))
         return to_native(response.read())
 
-    def recv_key(self, keyid, keyserver=None, keyring=None):
+    def recv_key(self, keyring, keyid, keyserver):
         """Receives key via keyserver"""
-        cmd = [self.pacman_key]
-        if keyring is not None:
-            cmd.extend(['--gpgdir', keyring])
-        if keyserver is not None:
-            cmd.extend(['--keyserver', keyserver])
+        cmd = [self.pacman_key, '--gpgdir', keyring, '--keyserver', keyserver, '--recv-keys', keyid]
+        self.module.run_command(cmd, check_rc=True)
+        self.lsign_key(keyring, keyid)
 
-        rc, stdout, stderr = self.module.run_command(cmd + ['--recv-keys', keyid])
-        if rc != 0:
-            self.module.fail_json(msg="failed to receive key %s from %s, error: %s" % (keyid, keyserver, stderr))
-        self.lsign_key(keyid, keyring)
-
-    def lsign_key(self, keyid, keyring=None):
+    def lsign_key(self, keyring, keyid):
         """Locally sign key"""
-        cmd = [self.pacman_key]
-        if keyring is not None:
-            cmd.extend(['--gpgdir', keyring])
-
-        rc, stdout, stderr = self.module.run_command(cmd + ['--lsign-key', keyid])
-        if rc != 0:
-            self.module.fail_json(msg="error locally signing key: %s" % stderr)
+        cmd = [self.pacman_key, '--gpgdir', keyring]
+        self.module.run_command(cmd + ['--lsign-key', keyid], check_rc=True)
 
     def save_key(self, data):
         "Saves key data to a temporary file"
@@ -249,65 +226,62 @@ class PacmanKey(object):
         tmpfile.close()
         return tmpname
 
-    def add_key(self, keyfile, keyid, fingerprint=None, keyring=None):
+    def add_key(self, keyring, keyfile, keyid, verify):
         """Add key to pacman's keyring"""
-        cmd = [self.pacman_key]
-        if keyring is not None:
-            cmd.extend(['--gpgdir', keyring])
+        if verify:
+            self.verify_keyfile(keyfile, keyid)
+        cmd = [self.pacman_key, '--gpgdir', keyring, '--add', keyfile]
+        self.module.run_command(cmd, check_rc=True)
+        self.lsign_key(keyring, keyid)
 
-        if fingerprint is not None:
-            self.verify_keyfile(keyfile, keyid, fingerprint)
-
-        rc, stdout, stderr = self.module.run_command(cmd + ['--add', keyfile])
-        if rc != 0:
-            self.module.fail_json(msg="error adding key to keyring: %s" % stderr)
-        self.lsign_key(keyid, keyring)
-
-    def remove_key(self, keyid, keyring=None):
+    def remove_key(self, keyring, keyid):
         """Remove key from pacman's keyring"""
-        cmd = [self.pacman_key]
-        if keyring is not None:
-            cmd.extend(['--gpgdir', keyring])
+        cmd = [self.pacman_key, '--gpgdir', keyring, '--delete', keyid]
+        self.module.run_command(cmd, check_rc=True)
 
-        rc, stdout, stderr = self.module.run_command(cmd + ['--delete', keyid])
-        if rc != 0:
-            self.module.fail_json(msg="error removing key from keyring: %s" % stderr)
-
-    def verify_keyfile(self, keyfile, keyid, fingerprint):
-        """Verify that keyfile matches the specified keyid & fingerprint"""
+    def verify_keyfile(self, keyfile, keyid):
+        """Verify that keyfile matches the specified key ID"""
         if keyfile is None:
             self.module.fail_json(msg="expected a key, got none")
         elif keyid is None:
-            self.module.fail_json(msg="expected a keyid, got none")
-        elif fingerprint is None:
-            self.module.fail_json(msg="expected a fingerprint, got none")
+            self.module.fail_json(msg="expected a key ID, got none")
 
-        rc, stdout, stderr = self.module.run_command([self.gpg, '--with-colons', '--with-fingerprint', '--batch', '--no-tty', '--show-keys', keyfile])
-        if rc != 0:
-            self.module.fail_json(msg="gpg returned an error: %s" % stderr)
+        rc, stdout, stderr = self.module.run_command(
+            [
+                self.gpg,
+                '--with-colons',
+                '--with-fingerprint',
+                '--batch',
+                '--no-tty',
+                '--show-keys',
+                keyfile
+            ],
+            check_rc=True,
+        )
 
-        extracted_keyid = extracted_fingerprint = None
+        extracted_keyid = None
         for line in stdout.splitlines():
-            if line.startswith('pub:'):
-                extracted_keyid = line.split(':')[4]
-            elif line.startswith('fpr:'):
-                extracted_fingerprint = line.split(':')[9]
+            if line.startswith('fpr:'):
+                extracted_keyid = line.split(':')[9]
                 break
 
         if extracted_keyid != keyid:
-            self.module.fail_json(msg="keyid does not match. expected %s, got %s" % (keyid, extracted_keyid))
-        elif extracted_fingerprint != fingerprint:
-            self.module.fail_json(msg="fingerprint does not match. expected %s, got %s" % (fingerprint, extracted_fingerprint))
+            self.module.fail_json(msg="key ID does not match. expected %s, got %s" % (keyid, extracted_keyid))
 
-    def key_in_keyring(self, keyid, keyring=None):
-        "Check if the keyid is in pacman's keyring"
-        if keyring is None:
-            keyring = '/etc/pacman.d/gnupg'
-
+    def key_in_keyring(self, keyring, keyid):
+        "Check if the key ID is in pacman's keyring"
         rc, stdout, stderr = self.module.run_command(
-            [self.gpg, '--with-colons', '--batch', '--no-tty',
-                '--no-default-keyring', '--keyring=' + keyring + '/pubring.gpg',
-                '--list-keys', keyid])
+            [
+                self.gpg,
+                '--with-colons',
+                '--batch',
+                '--no-tty',
+                '--no-default-keyring',
+                '--keyring=%s/pubring.gpg' % keyring,
+                '--list-keys', keyid
+            ],
+            check_rc=False,
+        )
         if rc != 0:
             if stderr.find("No public key") >= 0:
                 return False
@@ -324,17 +298,17 @@ def main():
             file=dict(type='path'),
             url=dict(type='str'),
             keyserver=dict(type='str'),
-            fingerprint=dict(type='str'),
+            verify=dict(type='bool', default=True),
             force_update=dict(type='bool', default=False),
-            keyring=dict(type='path'),
+            keyring=dict(type='path', default='/etc/pacman.d/gnupg'),
             state=dict(type='str', default='present', choices=['absent', 'present']),
         ),
         supports_check_mode=True,
         mutually_exclusive=(('data', 'file', 'url', 'keyserver'),),
+        required_if=[('state', 'present', ('data', 'file', 'url', 'keyserver'), True)],
     )
     PacmanKey(module)
 
 
 if __name__ == '__main__':
     main()
-

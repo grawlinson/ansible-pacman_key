@@ -2,9 +2,7 @@
 
 Ansible module to manage pacman's list of trusted keys.
 
-## Usage
+_DEPRECATED_ as of 04 June 2021, as this module has made it's way into the
+[community.general][upstream-pr] collection.
 
-Copy module to Ansible's _magic_ directory; `~/.ansible/plugins/modules/pacman_key.py`.
-
-Documentation is provided and easily accessible via `ansible-doc -t module pacman_key`.
-
+[upstream-pr]: https://github.com/ansible-collections/community.general/pull/778
